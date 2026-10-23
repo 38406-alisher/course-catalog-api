@@ -1,12 +1,21 @@
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 
 from data import find_course, get_all_courses
-from models import Course
+from models import Course, Enrollment, EnrollmentIn
 
 app = FastAPI(title="Course Catalog API")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# Вспомогательная функция зависимости для пагинации
+ENROLLMENTS: list[Enrollment] = []
+
+
 def pagination(page: int = 1, page_size: int = 20) -> dict:
     offset = (page - 1) * page_size
     return {"offset": offset, "limit": page_size}
@@ -25,19 +34,14 @@ def list_courses(
 ):
     courses = get_all_courses()
 
-    # 1. Фильтрация
-    # ВАЖНО: используем "is not None", чтобы правильно обрабатывать is_elective=False
     if is_elective is not None:
         courses = [c for c in courses if c.is_elective == is_elective]
 
-    # 2. Сортировка
     if sort == "title":
         courses = sorted(courses, key=lambda c: c.title)
     else:
-        # По умолчанию "popular" - по убыванию лайков
         courses = sorted(courses, key=lambda c: c.likes, reverse=True)
 
-    # 3. Пагинация (срезом списка)
     offset = p["offset"]
     limit = p["limit"]
     return courses[offset : offset + limit]
@@ -49,3 +53,32 @@ def get_course(course_id: str):
     if course is None:
         raise HTTPException(status_code=404, detail="Course not found")
     return course
+
+
+@app.post("/courses/{course_id}/like", response_model=Course)
+def like_course(course_id: str):
+    course = find_course(course_id)
+    if course is None:
+        raise HTTPException(status_code=404, detail="Course not found")
+    course.likes += 1
+    return course
+
+
+@app.post("/enrollments", response_model=Enrollment, status_code=201)
+def create_enrollment(data: EnrollmentIn):
+    course = find_course(data.course_id)
+    if course is None:
+        raise HTTPException(status_code=404, detail="Course not found")
+
+    new_enrollment = Enrollment(
+        id=len(ENROLLMENTS) + 1,
+        course_id=data.course_id,
+        student_name=data.student_name,
+    )
+    ENROLLMENTS.append(new_enrollment)
+    return new_enrollment
+
+
+@app.get("/enrollments", response_model=list[Enrollment])
+def list_enrollments():
+    return ENROLLMENTS
