@@ -1,0 +1,1 @@
+Standalone backend built with FastAPI providing course catalog endpoints with filtering, sorting, and pagination.
