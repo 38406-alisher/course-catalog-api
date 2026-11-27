@@ -9,6 +9,13 @@ from sqlalchemy.orm import Session
 from strawberry.dataloader import DataLoader
 from strawberry.fastapi import BaseContext, GraphQLRouter
 from strawberry.types import Info
+import os
+from strawberry.extensions import (
+    DisableIntrospection,
+    MaxAliasesLimiter,
+    MaxTokensLimiter,
+    QueryDepthLimiter,
+)
 
 import services
 from db import get_db
@@ -168,5 +175,13 @@ class Mutation:
             return LikePayload(user_errors=as_user_errors(err))
 
 
-schema = strawberry.Schema(query=Query, mutation=Mutation)
+extensions = [
+    QueryDepthLimiter(max_depth=5),
+    MaxAliasesLimiter(max_alias_count=10),
+    MaxTokensLimiter(max_token_count=500),
+]
+if os.getenv("ENV") == "prod":
+    extensions.append(DisableIntrospection())
+
+schema = strawberry.Schema(query=Query, mutation=Mutation, extensions=extensions)
 graphql_app = GraphQLRouter(schema, context_getter=get_context)
