@@ -23,7 +23,13 @@ class Base(DeclarativeBase):
     }
 
 
-engine = create_engine(settings.database_url, echo=settings.sql_echo)
+engine = create_engine(
+    settings.database_url,
+    echo=settings.sql_echo,
+    pool_size=20,
+    max_overflow=40,
+    pool_pre_ping=True,
+)
 SessionLocal = sessionmaker(engine)
 
 
