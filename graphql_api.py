@@ -1,3 +1,4 @@
+import os
 from collections import defaultdict
 from datetime import datetime
 from typing import Annotated
@@ -7,19 +8,35 @@ from fastapi import Depends
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from strawberry.dataloader import DataLoader
-from strawberry.fastapi import BaseContext, GraphQLRouter
-from strawberry.types import Info
-import os
 from strawberry.extensions import (
     DisableIntrospection,
     MaxAliasesLimiter,
     MaxTokensLimiter,
     QueryDepthLimiter,
 )
+from strawberry.fastapi import BaseContext, GraphQLRouter
+from strawberry.schema import Schema
+from strawberry.types import Info
 
 import services
 from db import get_db
 from models import Course, Enrollment, Student
+
+IS_PROD = os.getenv("ENV", "dev").lower() == "prod"
+
+
+class SafeSchema(Schema):
+    def process_errors(self, errors, execution_context=None):
+        super().process_errors(errors, execution_context)
+        if IS_PROD:
+            for err in errors:
+                if not isinstance(err.original_error, ValueError):
+                    err.message = "Internal server error"
+
+
+def validate_limit(limit: int) -> None:
+    if limit < 1 or limit > 100:
+        raise ValueError("limit must be between 1 and 100")
 
 
 def batch_loader(db: Session, column, many: bool = False) -> DataLoader:
@@ -127,12 +144,9 @@ def as_user_errors(err: services.ServiceError) -> list[UserError]:
 @strawberry.type
 class Query:
     @strawberry.field
-    def courses(
-        self, info: Info, is_elective: bool | None = None, limit: int = 20
-    ) -> list[CourseType]:
-        stmt = select(Course).order_by(Course.likes.desc(), Course.id).limit(limit)
-        if is_elective is not None:
-            stmt = stmt.where(Course.is_elective == is_elective)
+    def courses(self, info: Info, limit: int = 20) -> list[CourseType]:
+        validate_limit(limit)
+        stmt = select(Course).order_by(Course.id).limit(limit)
         return info.context.db.scalars(stmt).all()
 
     @strawberry.field
@@ -141,6 +155,7 @@ class Query:
 
     @strawberry.field
     def students(self, info: Info, limit: int = 20) -> list[StudentType]:
+        validate_limit(limit)
         stmt = select(Student).order_by(Student.id).limit(limit)
         return info.context.db.scalars(stmt).all()
 
@@ -150,6 +165,7 @@ class Query:
 
     @strawberry.field
     def enrollments(self, info: Info, limit: int = 20) -> list[EnrollmentType]:
+        validate_limit(limit)
         stmt = select(Enrollment).order_by(Enrollment.id).limit(limit)
         return info.context.db.scalars(stmt).all()
 
@@ -180,8 +196,12 @@ extensions = [
     MaxAliasesLimiter(max_alias_count=10),
     MaxTokensLimiter(max_token_count=500),
 ]
-if os.getenv("ENV") == "prod":
+if IS_PROD:
     extensions.append(DisableIntrospection())
 
-schema = strawberry.Schema(query=Query, mutation=Mutation, extensions=extensions)
+schema = SafeSchema(
+    query=Query,
+    mutation=Mutation,
+    extensions=extensions,
+)
 graphql_app = GraphQLRouter(schema, context_getter=get_context)

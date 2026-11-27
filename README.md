@@ -195,3 +195,135 @@ Scenario: fetching a student's profile (`studentId = 2`) and all enrolled course
 1. **Shared Service Layer (`services.py`):** Both REST and GraphQL delegate business logic to the same service functions, keeping validation, transactions, and atomic updates consistent.
 2. **Eliminating Overfetching & Underfetching:** In REST, assembling the student dashboard requires fetching all enrollments and making separate per-course requests with unused fields; GraphQL returns only the requested fields in one round-trip.
 3. **Separating System & Domain Errors:** Expected business rule failures in mutations return HTTP 200 with structured `userErrors`, whereas malformed queries and security guardrail violations are rejected at schema validation time.
+
+
+## Lab 8: GraphQL API (Strawberry), DataLoader, and REST Comparison
+
+### Quick Start from Scratch
+1. Start PostgreSQL on port `5434` and apply migrations & seed data:
+   ```powershell
+   alembic upgrade head
+   psql "postgresql://catalog_app:change-me@127.0.0.1:5434/course_catalog" -v ON_ERROR_STOP=1 -f seed.sql
+   ```
+2. Run the FastAPI + Strawberry GraphQL server:
+   ```powershell
+   .\.venv\Scripts\uvicorn.exe main:app --port 8000
+   ```
+3. Open GraphiQL at `http://127.0.0.1:8000/graphql` (automatically disabled when `ENV=prod`).
+
+### API Changes
+* **Shared Service Layer (`services.py` & `problem.py`):** Extracted business logic from REST routes into `services.py` and standardized REST errors as RFC 9457 `application/problem+json`.
+* **GraphQL Endpoint (`POST /graphql`):** Added Strawberry schema with per-request DB session and `DataLoader` instances in context.
+* **Queries & Mutations:** Added `courses(limit)`, `course(id)`, `student(id)`, `enroll(input)`, and `likeCourse(id)` returning structured `userErrors`.
+* **SQL Counter & Guardrails:** Added `X-SQL-Queries` response header, `QueryDepthLimiter(5)`, `MaxAliasesLimiter(10)`, `MaxTokensLimiter(500)`, `limit` range validation (`1..100`), error masking in `prod`, and `DisableIntrospection` when `ENV=prod`.
+
+### Example GraphQL Queries & Mutations
+
+**1. Nested "My Courses" Query:**
+```graphql
+query MyCourses($id: ID!) {
+  student(id: $id) {
+    id
+    name
+    email
+    enrollments {
+      enrolledAt
+      course {
+        id
+        title
+        credits
+        likes
+      }
+    }
+  }
+}
+```
+
+**2. Enroll Mutation with `userErrors`:**
+```graphql
+mutation EnrollStudent {
+  enroll(input: { studentId: "2", courseId: "api-design" }) {
+    enrollment {
+      studentId
+      courseId
+    }
+    userErrors {
+      code
+      field
+      message
+    }
+  }
+}
+```
+
+**3. Atomic Like Mutation:**
+```graphql
+mutation LikeCourse {
+  likeCourse(id: "api-design") {
+    course {
+      id
+      title
+      likes
+    }
+    userErrors {
+      code
+      message
+    }
+  }
+}
+```
+
+### REST vs GraphQL Comparison (`measure.py`)
+Scenario: loading student `#2` profile and all 3 enrolled courses (`title`, `credits`, `likes`).
+
+| Metric | REST (`GET /enrollments` + 3× `GET /courses/{id}`) | GraphQL (`POST /graphql`) | Improvement |
+| :--- | :---: | :---: | :--- |
+| **HTTP requests** | 4 | **1** | 4× fewer round-trips |
+| **SQL queries (`X-SQL-Queries`)** | 4 | **3** | Batched via `DataLoader` |
+| **Payload size (bytes)** | 1596 B | **310 B** | 5.15× smaller payload |
+| **Total time (ms)** | 132.13 ms | **33.53 ms** | 3.94× faster |
+
+**Conclusion:** GraphQL eliminated both underfetching (4 sequential HTTP calls reduced to 1) and overfetching (filtering all enrollments client-side and downloading unused course fields), cutting payload size by 80% and response latency nearly 4×.
+
+### Experiment Log (8 Experiments)
+
+1. **REST Problem Details Validation (`try_errors.py`)**
+   * **Observation:** Invalid payloads and duplicate enrollments returned inconsistent FastAPI default errors.
+   * **Cause:** Exception handlers were not normalized to RFC 9457.
+   * **Fix:** Added `problem.py` returning `application/problem+json` with `type`, `title`, `status`, and `detail` (`5 of 5` passed).
+2. **GraphQL Schema & Type Mapping (`try_graphql.py`)**
+   * **Observation:** Querying `course(id: "nope")` or unknown fields needed clean GraphQL semantics.
+   * **Cause:** Missing nullable return types on lookup resolvers.
+   * **Fix:** Typed `course(id)` as `CourseType | None` and verified `8 of 8` cases in `try_graphql.py`.
+3. **Domain Errors vs Transport Errors in Mutations**
+   * **Observation:** Raising exceptions for `ALREADY_ENROLLED` aborted the whole GraphQL response.
+   * **Cause:** Business rule violations were treated as unhandled execution errors.
+   * **Fix:** Added `userErrors` payload field (`ALREADY_ENROLLED`, `COURSE_NOT_FOUND`, `STUDENT_NOT_FOUND`) alongside nullable result objects.
+4. **N+1 Query Explosion on Nested Lists (`try_n_plus_1.py`)**
+   * **Observation:** Fetching 3 students with enrollments and courses triggered `1 + N + M` SQL statements (`X-SQL-Queries` > 10).
+   * **Cause:** Field resolvers queried SQLAlchemy individually per parent row.
+   * **Fix:** Implemented per-request `DataLoader` batching (`WHERE id IN (...)`), reducing queries to **3**.
+5. **Query Depth & Alias Flooding (`try_protection.py`)**
+   * **Observation:** Deep circular queries (`student -> enrollments -> student -> ...`) and repeated aliases could overload the server.
+   * **Cause:** No static query complexity limits on the Strawberry schema.
+   * **Fix:** Enabled `QueryDepthLimiter(max_depth=5)`, `MaxAliasesLimiter(max_alias_count=10)`, and `MaxTokensLimiter(max_token_count=500)`.
+6. **Introspection Exposure in Production**
+   * **Observation:** Full schema structure remained queryable via `__schema` regardless of environment.
+   * **Cause:** GraphiQL and introspection were enabled unconditionally.
+   * **Fix:** Configured `DisableIntrospection()` and error masking when `ENV=prod`.
+7. **Concurrent `likeCourse` Race Condition & Pool Exhaustion (`flood_likes.py`)**
+   * **Observation:** Sending 50 concurrent `likeCourse` mutations hit `QueuePool limit of size 5 overflow 10 reached` and risked lost updates.
+   * **Cause:** Read-modify-write in Python is non-atomic and default SQLAlchemy pool (`15`) was too small for burst concurrency.
+   * **Fix:** Used atomic SQL `UPDATE courses SET likes = likes + 1` in `services.py` and tuned `db.py` (`pool_size=20, max_overflow=40`), achieving exact `+50` diff.
+8. **End-to-End Frontend & Benchmark Latency (`measure.py`)**
+   * **Observation:** The REST "My courses" page required 4 HTTP requests (1596 bytes, 132.13 ms).
+   * **Cause:** Client-side filtering of `/enrollments` followed by N per-course fetches.
+   * **Fix:** Built `/my-courses` on GraphQL, cutting load to 1 HTTP request, 310 bytes, and 33.53 ms.
+
+### Decisions
+1. **Why use `userErrors` in mutation payloads instead of top-level GraphQL `errors`?**
+   Top-level `errors` represent unexpected system, syntax, or validation failures and nullify the entire data branch. Expected business outcomes (like `ALREADY_ENROLLED` or `COURSE_NOT_FOUND`) are part of the typed schema contract (`userErrors`), allowing the Next.js client to render field-specific messages cleanly without losing partial mutation data.
+2. **Why instantiate `DataLoader` per request in the GraphQL context instead of globally?**
+   `DataLoader` caches loaded objects in memory for the lifetime of its instance. A global loader would serve stale data across different users and requests and leak memory, whereas a per-request loader deduplicates and batches queries within a single GraphQL execution tree and is garbage-collected immediately afterward.
+3. **When is REST still preferable over GraphQL in this project?**
+   REST remains simpler and more efficient for standard HTTP caching (CDN/browser caching on `GET /courses` by URL), simple CRUD endpoints with fixed shapes, and binary/webhook integrations where a single query language and schema parser add unnecessary overhead.
