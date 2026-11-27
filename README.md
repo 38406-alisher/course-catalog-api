@@ -133,3 +133,65 @@ UPDATE alembic_version SET version_num='0002' WHERE alembic_version.version_num 
   - alembic current -> 0002 (head)
   - alembic check -> No new upgrade operations detected.
   - GET /courses?level=beginner -> returns api-design and ai-integration with "level": "beginner".
+
+  ## Lab 8: GraphQL API (Strawberry), DataLoader, and REST Comparison
+
+### Architecture & API Changes
+* **Single `POST /graphql` endpoint** (along with the built-in GraphiQL IDE in development mode) implemented with **Strawberry GraphQL** on top of the shared service layer (`services.py`).
+* **Types & Queries (`Query`):**
+  * `courses(limit)` — lists available courses;
+  * `course(id)` — retrieves a single course by ID (returns `null` if not found);
+  * `student(id)` — retrieves a student profile along with nested enrollments (`enrollments`) and course details (`course`).
+* **Mutations (`Mutation`):**
+  * `enroll(studentId, courseId)` — enrolls a student in a course and returns structured domain errors in `userErrors` (`ALREADY_ENROLLED`, `COURSE_NOT_FOUND`, `STUDENT_NOT_FOUND`);
+  * `likeCourse(id)` — atomically increments the course like counter (`UPDATE courses SET likes = likes + 1`) without race conditions.
+* **N+1 Query Optimization (`DataLoader`):**
+  * Implemented a generic `batch_loader` using `strawberry.dataloader.DataLoader` to collect keys per execution tick and fetch related records in a single `WHERE column IN (...)` query.
+  * Added the `X-SQL-Queries` response header to track exact SQL query counts per request.
+* **Connection Pool Tuning (`db.py`):**
+  * Updated `create_engine` with `pool_size=20`, `max_overflow=40`, and `pool_pre_ping=True` to handle concurrent request bursts reliably.
+
+### GraphQL Security Guardrails
+The schema includes Strawberry extensions to prevent abusive or overly expensive queries:
+* `QueryDepthLimiter(max_depth=5)` — blocks deeply nested recursive queries;
+* `MaxAliasesLimiter(max_alias_count=10)` — prevents alias flooding;
+* `MaxTokensLimiter(max_token_count=500)` — caps maximum query token size;
+* `DisableIntrospection()` — automatically disables schema introspection when `ENV=prod` is set.
+
+### Frontend Integration (`my-app`)
+* Added the GraphQL client (`src/lib/graphql.ts`) and the `/my-courses` page (`src/app/my-courses/page.tsx`, e.g., `http://localhost:3000/my-courses?studentId=2`), which fetches a student's profile and all enrolled courses in a single GraphQL request instead of multiple REST calls.
+
+### Verification & Test Commands
+Ensure the server is running on port `8000` (`.\.venv\Scripts\uvicorn.exe main:app --port 8000`) and the database is seeded (`psql "postgresql://catalog_app:change-me@127.0.0.1:5434/course_catalog" -v ON_ERROR_STOP=1 -f seed.sql`):
+
+```powershell
+# Verify queries, mutations, and error handling (expected: 8 of 8 as expected)
+.\.venv\Scripts\python.exe try_graphql.py
+
+# Verify N+1 elimination via DataLoader (expected: 3 SQL queries)
+.\.venv\Scripts\python.exe try_n_plus_1.py
+
+# Verify depth, alias, and token limits (expected: allowed for normal query, blocked for 3 attacks)
+.\.venv\Scripts\python.exe try_protection.py
+
+# Stress-test 50 concurrent likeCourse mutations (expected: diff: +50)
+.\.venv\Scripts\python.exe flood_likes.py
+
+# Benchmark REST vs GraphQL for student #2
+.\.venv\Scripts\python.exe measure.py
+```
+
+### Experiment Log & Benchmark (REST vs GraphQL)
+Scenario: fetching a student's profile (`studentId = 2`) and all enrolled courses (`title`, `credits`, `likes`).
+
+| Metric | REST (`GET /enrollments` + 3× `GET /courses/{id}`) | GraphQL (`POST /graphql`) | Improvement |
+| :--- | :---: | :---: | :--- |
+| **HTTP requests** | 4 | **1** | 4× fewer network round-trips |
+| **SQL queries (`X-SQL-Queries`)** | 4 | **3** | Batched nested lookups via `DataLoader` |
+| **Payload (bytes)** | 1596 B | **310 B** | 5.15× smaller payload (no overfetching) |
+| **Time (ms)** | 132.13 ms | **33.53 ms** | 3.94× faster execution |
+
+### Key Design Decisions
+1. **Shared Service Layer (`services.py`):** Both REST and GraphQL delegate business logic to the same service functions, keeping validation, transactions, and atomic updates consistent.
+2. **Eliminating Overfetching & Underfetching:** In REST, assembling the student dashboard requires fetching all enrollments and making separate per-course requests with unused fields; GraphQL returns only the requested fields in one round-trip.
+3. **Separating System & Domain Errors:** Expected business rule failures in mutations return HTTP 200 with structured `userErrors`, whereas malformed queries and security guardrail violations are rejected at schema validation time.
